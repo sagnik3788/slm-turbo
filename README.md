@@ -6,8 +6,6 @@
 
 <p align="center"><strong>Profile and auto-tune local AI for your specific GPU.</strong></p>
 
-> Stop guessing. Measure. Diagnose. Accelerate.
-
 Automated inference optimizer for LLMs. Profiles your GPU, classifies the bottleneck with a roofline model, and prescribes targeted fixes — KV quantization, prefix caching, chunked prefill, backend selection. Outputs a version-controlled recipe, not magic flags.
 
 ## Architecture
