@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/download.svg" width="180" alt="SLM Turbo logo">
+  <img src="assets/download.svg" width="200" alt="SLM Turbo logo">
 </p>
 
 <!-- <h1 align="center">SLM Turbo</h1> -->
