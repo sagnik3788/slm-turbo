@@ -1,3 +1,4 @@
+from huggingface_hub import model_info
 from transformers import AutoConfig
 
 from schema import ModelTopology
@@ -14,6 +15,8 @@ def build_topology(model_id: str) -> ModelTopology:
     )
     architectures = getattr(hf_config, "architectures", []) or []
 
+    num_params = getattr(model_info(model_id).safetensors, "total", None)
+
     return ModelTopology(
         model_id=model_id,
         num_attention_heads=num_attention_heads,
@@ -21,8 +24,9 @@ def build_topology(model_id: str) -> ModelTopology:
         hidden_size=hf_config.hidden_size,
         head_dim=head_dim,
         num_hidden_layers=hf_config.num_hidden_layers,
+        num_params=num_params,
         sliding_window=getattr(hf_config, "sliding_window", None),
-        dtype=str(hf_config.dtype),
+        dtype=str(getattr(hf_config, "dtype", "float16")).replace("torch.", ""),
         max_position_embeddings=getattr(hf_config, "max_position_embeddings", 2048),
         architectures=architectures,
         # is_vlm=?

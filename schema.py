@@ -10,6 +10,7 @@ class ModelTopology(BaseModel):
     num_kv_heads: int = Field(..., gt=0)
     head_dim: int
     num_hidden_layers: int
+    num_params: Optional[int] = None
     sliding_window: Optional[int] = None
     max_position_embeddings: int
     dtype: str
@@ -84,3 +85,13 @@ def _hash_dict(data: dict) -> str:
 
     payload = json.dumps(data, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+class ProfileSnapshot(BaseModel):
+    prefill_flops: float
+    decode_flops: float  # flops per decode token
+    prefill_memory_bytes: float
+    decode_memory_bytes: float
+    model_params: int
+    model_size_bytes: float
+    kv_cache_bytes_per_token: int
