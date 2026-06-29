@@ -1,4 +1,10 @@
-# slm-turbo
+<p align="center">
+  <img src="assets/download.svg" width="180" alt="SLM Turbo logo">
+</p>
+
+<h1 align="center">SLM Turbo</h1>
+
+<p align="center"><strong>Profile and auto-tune local AI for your specific GPU.</strong></p>
 
 > Stop guessing. Measure. Diagnose. Accelerate.
 
