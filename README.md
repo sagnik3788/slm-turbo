@@ -34,6 +34,10 @@ slm-turbo status    →  live: tokens/sec, p50/p99 latency, GPU%, KV cache usage
 
 **Roofline profiler** — analytical by default (math, no GPU load). Falls back to empirical forward-pass when model fits VRAM — real CUDA overhead, real fragmentation, real bandwidth numbers. No spreadsheet guesses.
 
+![roofline](diagrams/roofline.png)
+
+The roofline model classifies each inference phase as memory-bound or compute-bound by comparing arithmetic intensity (FLOPs per byte) against the GPU's ridge point (peak compute ÷ memory bandwidth).
+
 **Custom Triton kernels** — fused KV cache dequant + attention. Asymmetric quantization: keys 4-bit, values 2-bit. Dequant in registers — never writes fp16 back to DRAM. Targets sm_75+ (GTX 1650 and up).
 
 **Recipe engine** — 4 optimizers evaluated per (model, GPU) pair. Declarative YAML output. Human-readable, editable, diffable in git.
