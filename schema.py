@@ -95,3 +95,8 @@ class ProfileSnapshot(BaseModel):
     model_params: int
     model_size_bytes: float
     kv_cache_bytes_per_token: int
+
+
+class Bottleneck(BaseModel):
+    prefill: Literal["memory_bound", "compute_bound"]
+    decode: Literal["memory_bound", "compute_bound"]
