@@ -1,6 +1,9 @@
 <p align="center">
   <img src="assets/download.svg" width="320" alt="SLM Turbo logo">
 </p>
+<p align="center">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
 <p align="center"><strong>Profile and auto-tune local AI for your specific GPU.</strong></p>
 
 Automated inference optimizer for LLMs. Profiles your GPU, classifies the bottleneck with a roofline model, and prescribes targeted fixes — KV quantization, prefix caching, chunked prefill, backend selection. Outputs a version-controlled recipe, not magic flags.
