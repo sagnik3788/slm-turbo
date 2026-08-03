@@ -24,6 +24,11 @@ dependencies = [
 [project.scripts]
 slm-turbo = "cli:app"
 
+# vLLM plugin entry point: loaded in every vLLM process (process0, EngineCore,
+# workers) so the CUSTOM attention backend override is registered process-wide.
+[project.entry-points."vllm.general_plugins"]
+slm-turbo = "adapters.vllm_adapter:register_plugin"
+
 [tool.setuptools]
 py-modules = [
     "schema",
@@ -34,3 +39,4 @@ py-modules = [
     "recipe",
     "cli",
 ]
+packages = ["adapters", "kernels"]

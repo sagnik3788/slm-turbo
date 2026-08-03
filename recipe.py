@@ -14,6 +14,7 @@ class RecipeEngine:
     ) -> Recipe:
         return Recipe(
             version="1.0",
+            model_id=topology.model_id,
             topology_hash=_hash_dict(topology.model_dump()),
             device_hash=_hash_dict(device.model_dump()),
             steps=steps,
