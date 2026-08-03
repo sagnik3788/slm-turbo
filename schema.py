@@ -63,6 +63,7 @@ class OptimizationStep(BaseModel):
 
 class Recipe(BaseModel):
     version: str = "1.0"
+    model_id: Optional[str] = None
     topology_hash: str
     device_hash: str
     steps: List[OptimizationStep] = []
