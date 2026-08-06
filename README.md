@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/download.svg" width="320" alt="SLM Turbo logo">
+  <img src="https://raw.githubusercontent.com/sagnik3788/slm-turbo/main/assets/download.svg" width="320" alt="SLM Turbo logo">
 </p>
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
@@ -10,7 +10,7 @@ Automated inference optimizer for LLMs. Profiles your GPU, classifies the bottle
 
 ## Architecture
 
-![architecture](diagrams/arch.png)
+![architecture](https://raw.githubusercontent.com/sagnik3788/slm-turbo/main/diagrams/arch.png)
 
 ## How it works
 
@@ -34,7 +34,7 @@ slm-turbo status    →  live: tokens/sec, p50/p99 latency, GPU%, KV cache usage
 
 **Roofline profiler** — analytical by default (math, no GPU load). Falls back to empirical forward-pass when model fits VRAM — real CUDA overhead, real fragmentation, real bandwidth numbers. No spreadsheet guesses.
 
-![roofline](diagrams/roofline.png)
+![roofline](https://raw.githubusercontent.com/sagnik3788/slm-turbo/main/diagrams/roofline.png)
 
 The roofline model classifies each inference phase as memory-bound or compute-bound by comparing arithmetic intensity (FLOPs per byte) against the GPU's ridge point (peak compute ÷ memory bandwidth).
 
@@ -52,11 +52,36 @@ The roofline model classifies each inference phase as memory-bound or compute-bo
 | Models | Any HuggingFace transformer. VLMs, 1B–70B+. |
 | Backends | vLLM · SGLang (planned) · TensorRT-LLM (planned) |
 
-## Quick start
+## Install
 
 ```bash
+# From PyPI — base install (analyze / optimize / doctor)
 pip install slm-turbo
 
+# Add the vLLM serving backend (needed for `slm-turbo serve`)
+pip install "slm-turbo[gpu]"
+
+# Or with uv — run directly without installing:
+uvx slm-turbo analyze --model meta-llama/Llama-2-7b-hf
+
+# Or with uv — install the CLI globally:
+uv tool install slm-turbo
+uv tool install "slm-turbo[gpu]"    # with the vLLM backend
+```
+
+Requires Linux + NVIDIA GPU (Turing/sm_75 or newer). `analyze` needs PyTorch + Transformers; `serve` additionally needs vLLM (the `[gpu]` extra).
+
+### From source (development)
+
+```bash
+git clone <repo-url> && cd slm-turbo
+pip install -e ".[gpu]"     # or: uv sync --extra gpu
+slm-turbo doctor
+```
+
+## Usage
+
+```bash
 slm-turbo doctor              # check env: CUDA, PyTorch, vLLM, GPU, permissions
 slm-turbo analyze  --model meta-llama/Llama-2-7b-hf
 slm-turbo optimize --model meta-llama/Llama-2-7b-hf
@@ -89,7 +114,7 @@ is **2–4.7× faster than fp16 attention**:
 | 1024 | 136.1 µs | 525.4 µs | 3.86× | 396.3 µs | 908.9 µs | 2.29× |
 | 2048 | 227.8 µs | 967.7 µs | 4.25× | 861.6 µs | 1794.0 µs | 2.08× |
 
-![Decode speedup](docs/decode_speedup.png)
+![Decode speedup](https://raw.githubusercontent.com/sagnik3788/slm-turbo/main/docs/decode_speedup.png)
 
 KV-cache memory per token drops **16–32×** (fp16 → 4-bit packed): e.g. 8 MB →
 256 KB for D=64, KV=4 at 2048 tokens.
@@ -106,7 +131,7 @@ Full-model decode (transformers eager, interleaved timing) — the kernel is
 | Qwen2-0.5B-Instruct | 24 | 64 | 45.9 tok/s | **38.7 tok/s** (0.84×) |
 | Qwen2-1.5B-Instruct | 28 | 128 | 35.4 tok/s | **31.3 tok/s** (0.89×) |
 
-![Model throughput](docs/model_throughput.png)
+![Model throughput](https://raw.githubusercontent.com/sagnik3788/slm-turbo/main/docs/model_throughput.png)
 
 ### Native packed KV cache in vLLM (`--custom` backend)
 
