@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import torch  # noqa: F401  (used by the impl methods below)
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -65,7 +67,76 @@ _KERNEL_CALLS = 0
 
 # ---------------------------------------------------------------------------
 # Layer 2: vLLM attention backend injection (CUSTOM registry)
+#
+# PACKED 4-BIT KV CACHE (TurboQuant-style, native layout)
 # ---------------------------------------------------------------------------
+# vLLM allocates the KV cache from the shape our backend reports via
+# `get_kv_cache_shape()`, and writes tokens through the impl's
+# `do_kv_cache_update()`. We use both hooks to make the cache NATIVELY
+# 4-bit packed instead of fp16:
+#
+#   cache shape  = (num_blocks, block_size, num_kv_heads, SLOT)
+#   SLOT         = head_size + 8 bytes per (position, kv_head):
+#                    [0 : D/2)  packed K   (4-bit, even dim = low nibble)
+#                    [D/2 : D)  packed V   (4-bit)
+#                    [D : D+8)  k_min, k_step, v_min, v_step  (fp16 each)
+#
+# Quantization is PER-TOKEN min/step (KIVI-style V; here both K and V):
+#   value = nibble * step + min,  step = (max-min)/15
+# This is O(1) to store incrementally (each token's own min/max is known the
+# moment it is written) and immune to ruler drift — the failure mode of the
+# old fixed-ruler shim. The decode kernel dequantizes in registers, reading
+# 4x less memory than fp16 attention.
+#
+# Integration WITHOUT forking vLLM (AGENTS.md: "the adapter is the only
+# vLLM-coupled file"): instead of editing vLLM source, `register_plugin()`
+# monkey-patches two tiny hooks at import time (idempotent, only affects
+# processes that load this adapter):
+#   1. `AttentionLayer.get_kv_cache_spec` -> when the CUSTOM backend is
+#      active, return a TQFullAttentionSpec whose page size = packed slot
+#      size. This is what makes vLLM *allocate* 4x less cache memory.
+#   2. (registration itself) `AttentionBackendEnum.CUSTOM` -> our backend.
+# Stock vLLM is untouched; slm-turbo works on an unmodified checkout.
+# ---------------------------------------------------------------------------
+
+def _patch_attention_layer_spec() -> bool:
+    """Make vLLM allocate the KV cache at the packed 4-bit size.
+
+    vLLM sizes each layer's cache from `AttentionLayer.get_kv_cache_spec()`
+    (spec.page_size_bytes drives the byte allocation). We wrap the original
+    method: when the layer runs our CUSTOM backend, we return a spec whose
+    page size is the packed slot (D + 8 bytes) instead of the fp16 formula.
+    Uses vLLM's own `TQFullAttentionSpec` page-size override mechanism.
+    """
+    try:
+        from vllm.model_executor.layers.attention.attention import Attention
+        from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+    except Exception as e:
+        logger.warning("spec patch unavailable (%s)", e)
+        return False
+
+    _orig = Attention.get_kv_cache_spec
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = _orig(self, vllm_config)
+        backend = getattr(self, "attn_backend", None)
+        if backend is not None and backend.get_name() == "CUSTOM":
+            # Packed slot: D/2 (K) + D/2 (V) + 8 bytes of fp16 min/step rulers.
+            slot = self.head_size + 8
+            return TQFullAttentionSpec(
+                block_size=spec.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=torch.uint8,
+                kv_quant_mode=spec.kv_quant_mode,
+                tq_slot_size=slot,
+            )
+        return spec
+
+    Attention.get_kv_cache_spec = get_kv_cache_spec
+    return True
+
 
 def _register_custom_backend() -> bool:
     """Define + register QuantizedKVAttentionBackend against the installed vLLM.
@@ -83,116 +154,139 @@ def _register_custom_backend() -> bool:
         logger.warning("vLLM attention API not found (%s); custom backend disabled", e)
         return False
 
-    class QuantizedKVAttentionImpl(TritonAttentionImpl):
-        """Triton decode attention, but with our 4-bit fused kernel for eligible
-        single-request decodes. Everything else defers to the stock Triton path."""
+    _patch_attention_layer_spec()
 
-        def __init__(self, num_heads, head_size, scale, num_kv_heads=None, alibi_slopes=None,
-                     sliding_window=None, kv_cache_dtype="auto", logits_soft_cap=None,
-                     attn_type="decoder", kv_sharing_target_layer_name=None, **kwargs):
-            super().__init__(num_heads, head_size, scale, num_kv_heads, alibi_slopes,
-                             sliding_window, kv_cache_dtype, logits_soft_cap,
-                             attn_type, kv_sharing_target_layer_name, **kwargs)
-            self._slm_kernel = None
+    class QuantizedKVAttentionImpl(TritonAttentionImpl):
+        """Native 4-bit packed KV cache: quantize-on-write store + fused
+        per-token decode kernel. Prefill runs SDPA on the raw fp16 K/V of the
+        current chunk (matching TurboQuant), then stores quantized."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._slm_kernel = False
             self._slm_kernel_err: Optional[str] = None
             try:
-                import sys as _sys
-                if str(_REPO_ROOT) not in _sys.path:
-                    _sys.path.insert(0, str(_REPO_ROOT))
-                from kernels.kv_dequant import kv_dequant_decode_attention
-                from kernels.quantize import quantize_kv
-
-                self._slm_attn = kv_dequant_decode_attention
-                self._slm_quantize = quantize_kv
+                from kernels.kv_dequant import (
+                    kv_dequant_decode_per_token_paged_attention,
+                    kv_quantize_store,
+                )
+                self._slm_decode_paged = kv_dequant_decode_per_token_paged_attention
+                self._slm_store = kv_quantize_store
                 self._slm_kernel = torch.cuda.is_available()
                 if not self._slm_kernel:
                     self._slm_kernel_err = "no CUDA device"
             except Exception as e:
                 self._slm_kernel_err = f"{type(e).__name__}: {e}"
             if self._slm_kernel_err:
-                logger.warning("slm-turbo kernel disabled in this process: %s", self._slm_kernel_err)
+                logger.warning("slm-turbo kernel disabled in this process: %s",
+                               self._slm_kernel_err)
 
-        def forward(self, layer, query, key, value, kv_cache, attn_metadata, output,
-                    output_scale=None, output_block_scale=None):
-            if self._slm_kernel and attn_metadata is not None and self._try_slm_decode(
-                    query, kv_cache, attn_metadata, output):
-                return output
-            return super().forward(layer, query, key, value, kv_cache, attn_metadata,
-                                   output, output_scale, output_block_scale)
-
-        def _try_slm_decode(self, query, kv_cache, attn_metadata, output) -> bool:
-            """Gather -> quantize -> fused 4-bit decode kernel -> scatter. Pure best-effort."""
-            global _KERNEL_CALLS
-
-            def _gate(name: str) -> bool:
-                """Log the first occurrence of a rejected eligibility gate."""
-                if not getattr(self, "_slm_gates_logged", None):
-                    self._slm_gates_logged = set()
-                if name not in self._slm_gates_logged:
-                    self._slm_gates_logged.add(name)
-                    logger.debug("slm-turbo decode gate rejected: %s", name)
-                return False
-
+        # ---- quantize-on-write: called once per token batch BEFORE forward --
+        def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+            """Quantize fp16 K/V and store the packed 4-bit slot. O(N) per call
+            (N = tokens in this write batch; 1 for decode)."""
+            if kv_cache is None or kv_cache.numel() == 0:
+                return
+            if not self._slm_kernel:
+                return
             try:
-                # --- eligibility gates (any miss -> fall back to stock Triton) ---
-                # TritonAttentionMetadata has no num_reqs; derive it from seq_lens.
-                num_reqs = int(attn_metadata.seq_lens.shape[0])
-                if num_reqs != 1:
-                    return _gate(f"num_reqs={num_reqs}")
-                if attn_metadata.max_query_len != 1:
-                    return _gate(f"max_query_len={attn_metadata.max_query_len}")
-                if attn_metadata.num_actual_tokens != 1:
-                    return _gate(f"num_actual_tokens={attn_metadata.num_actual_tokens}")
-                if self.head_size not in SUPPORTED_HEAD_SIZES:
-                    return _gate(f"head_size={self.head_size}")
-                if query.dtype != torch.float16:
-                    return _gate(f"dtype={query.dtype}")
-                if getattr(self, "alibi_slopes", None) is not None:
-                    return _gate("alibi_slopes")
-                # vLLM encodes "no sliding window" as (-1, -1)
-                sw = getattr(self, "sliding_window", None)
-                if sw is not None and sw != (-1, -1):
-                    return _gate(f"sliding_window={sw}")
-                kv_dtype = getattr(self, "kv_cache_dtype", "auto") or "auto"
-                if "fp8" in kv_dtype or "int8" in kv_dtype:
-                    return _gate(f"kv_dtype={kv_dtype}")
-                if self.attn_type not in ("decoder",):
-                    return _gate(f"attn_type={self.attn_type}")
-
-                # --- paged fp16 cache: [num_blocks, 2, block_size, KV, D] ---
-                key_cache, value_cache = kv_cache[:, 0], kv_cache[:, 1]
-                num_kv_heads = key_cache.shape[2]
-                block_size = key_cache.shape[1]
-                seq_len = int(attn_metadata.seq_lens[0])
-                if seq_len < 1:
-                    return False
-                n_blocks = (seq_len + block_size - 1) // block_size
-                blocks = attn_metadata.block_table[0, :n_blocks]
-
-                k_cache = (key_cache[blocks].transpose(0, 2).contiguous()
-                           .reshape(num_kv_heads, -1, self.head_size)[:, :seq_len])
-                v_cache = (value_cache[blocks].transpose(0, 2).contiguous()
-                           .reshape(num_kv_heads, -1, self.head_size)[:, :seq_len])
-                q = query[:1].permute(1, 0, 2).contiguous()  # [H, 1, D]
-
-                kp, ks, kz, vp, vs, vz = self._slm_quantize(k_cache, v_cache)
-                out = self._slm_attn(q, kp, ks, kz, vp, vs, vz, num_kv_heads=num_kv_heads)
-                # v1 attention output buffer is [num_tokens, num_heads, head_size]
-                output[:1].copy_(out.permute(1, 0, 2))  # [H,1,D] -> [1,H,D]
-                _KERNEL_CALLS += 1
-                if _KERNEL_CALLS == 1:
-                    logger.info("slm-turbo 4-bit decode kernel serving inside vLLM (head_size=%d)", self.head_size)
-                return True
+                # key/value: [num_tokens, num_kv_heads, head_size] fp16
+                key = key.contiguous()
+                value = value.contiguous()
+                block_size = kv_cache.shape[1]
+                self._slm_store(key, value, kv_cache, slot_mapping, block_size)
             except Exception as e:
-                if not getattr(self, "_slm_fallback_logged", False):
-                    self._slm_fallback_logged = True
-                    logger.warning("slm-turbo decode kernel unavailable, falling back to stock Triton: %s: %s",
-                                   type(e).__name__, e)
-                return False
+                # We cannot silently drop KV writes — the cache is packed and
+                # stock Triton can't read it. Fail loudly if the store breaks.
+                logger.error("slm-turbo kv store failed: %s: %s",
+                             type(e).__name__, e)
+                raise
+
+        # ---- forward ----------------------------------------------------------
+        def forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                    output, output_scale=None, output_block_scale=None):
+            num_tokens = query.shape[0]
+            if output is None:
+                output = torch.zeros(num_tokens, self.num_heads * self.head_size,
+                                     dtype=query.dtype, device=query.device)
+            if attn_metadata is None:
+                return output.fill_(0)
+            N = attn_metadata.num_actual_tokens
+            if N <= 0:
+                return output.fill_(0)
+            q = query[:N]
+            if attn_metadata.max_query_len > 1:
+                attn_out = self._prefill_attention(
+                    q, key[:N], value[:N], kv_cache, attn_metadata)
+            else:
+                attn_out = self._decode_attention(q, kv_cache, attn_metadata)
+            if output.ndim == 3:
+                output[:N] = attn_out.to(output.dtype)
+            else:
+                output[:N] = attn_out.reshape(N, -1).to(output.dtype)
+            return output
+
+        # ---- prefill: SDPA on raw fp16 K/V (first chunk) ---------------------
+        def _prefill_attention(self, query, key, value, kv_cache, attn_metadata):
+            # query/key/value: [num_tokens, heads, head_size] fp16
+            N, Hq, D = query.shape
+            Hk = key.shape[1]
+            use_gqa = Hk < Hq
+            q_t = query.transpose(0, 1).unsqueeze(0)   # [1, Hq, N, D]
+            k_t = key.transpose(0, 1).unsqueeze(0)     # [1, Hk, N, D]
+            v_t = value.transpose(0, 1).unsqueeze(0)   # [1, Hk, N, D]
+            # First-chunk prefill: all K/V are in the current batch. (Chunked
+            # continuation prefill is not in v1 scope; the CLI is one-shot.)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=True,
+                scale=self.scale, enable_gqa=use_gqa)
+            return out[0].transpose(0, 1)              # [N, Hq, D]
+
+        # ---- decode: paged per-token fused kernel (reads cache directly) -----
+        def _decode_attention(self, query, kv_cache, attn_metadata):
+            # query: [num_tokens, num_heads, head_size]; decode = 1 tok/req.
+            # kv_cache: [num_blocks, block_size, num_kv_heads, D+8] uint8.
+            global _KERNEL_CALLS
+            block_size = kv_cache.shape[1]
+            num_kv_heads = kv_cache.shape[2]
+            D = self.head_size
+            out = torch.empty(query.shape[0], self.num_heads, D,
+                              dtype=query.dtype, device=query.device)
+
+            # Cache host-side conversions keyed by the metadata object: vLLM
+            # reuses the SAME metadata across all layers within one step, so
+            # calling .tolist()/.to(int64) here once per step avoids a GPU->CPU
+            # sync on every one of the 22 layers (that was ~4ms/step idle).
+            cache = getattr(self, "_slm_meta_cache", None)
+            if cache is None or cache[0] is not attn_metadata:
+                seq_lens_host = attn_metadata.seq_lens.tolist()
+                blocks_host = [
+                    attn_metadata.block_table[r].to(torch.int64).contiguous()
+                    for r in range(len(seq_lens_host))
+                ]
+                cache = (attn_metadata, seq_lens_host, blocks_host)
+                self._slm_meta_cache = cache
+            _, seq_lens_host, blocks_host = cache
+
+            for r in range(len(seq_lens_host)):
+                seq_len = seq_lens_host[r]
+                if seq_len < 1:
+                    continue
+                q = query[r:r + 1].permute(1, 0, 2).contiguous()  # [H, 1, D]
+                o = self._slm_decode_paged(q, kv_cache, blocks_host[r],
+                                           seq_len, block_size, num_kv_heads)
+                out[r] = o.permute(1, 0, 2)
+                _KERNEL_CALLS += 1
+            if _KERNEL_CALLS and getattr(self, "_slm_logged", False) is False:
+                self._slm_logged = True
+                logger.info("slm-turbo 4-bit decode kernel serving inside vLLM (head_size=%d)",
+                            self.head_size)
+            return out
 
     class QuantizedKVAttentionBackend(TritonAttentionBackend):
-        """Stock Triton metadata machinery + our impl. get_name() must be an
-        AttentionBackendEnum member — "CUSTOM" is vLLM's third-party slot."""
+        """Stock Triton metadata machinery + packed 4-bit KV layout + our impl.
+        get_name() must be an AttentionBackendEnum member — "CUSTOM" is
+        vLLM's third-party slot."""
 
         @staticmethod
         def get_name() -> str:
@@ -201,6 +295,28 @@ def _register_custom_backend() -> bool:
         @staticmethod
         def get_impl_cls() -> type:
             return QuantizedKVAttentionImpl
+
+        @staticmethod
+        def get_kv_cache_shape(
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str = "auto",
+        ) -> tuple[int, ...]:
+            # Packed 4-bit layout: D bytes of K+V + 8 bytes of min/step rulers.
+            return (num_blocks, block_size, num_kv_heads, head_size + 8)
+
+        @staticmethod
+        def get_kv_cache_stride_order(
+            include_num_layers_dimension: bool = False,
+        ) -> tuple[int, ...]:
+            # Physical layout == logical layout (no permutation needed).
+            raise NotImplementedError  # -> vLLM falls back to identity
+
+        @classmethod
+        def supports_batch_invariance(cls) -> bool:
+            return True
 
     register_backend(AttentionBackendEnum.CUSTOM, f"{__name__}.QuantizedKVAttentionBackend")
     logger.info("slm-turbo vLLM backend registered as --attention-backend CUSTOM")

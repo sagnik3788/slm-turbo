@@ -12,10 +12,66 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent))
 
 from kernels.kv_dequant import kv_dequant_decode_attention, kv_dequant_prefill_attention  # noqa: E402
-from kernels.quantize import quantize_kv, dequantize_tensor, quantize_tensor  # noqa: E402
 
 ERR_GATE = 1e-2
 RESULTS = []
+
+
+# ---------------------------------------------------------------------------
+# Host-side per-channel 4-bit quantizer (was kernels/quantize.py, inlined here
+# because only the standalone benchmark uses it — the vLLM serving path uses
+# the CUDA quantize-store kernel instead).
+# ---------------------------------------------------------------------------
+
+def compute_scale_zero(x: torch.Tensor, bits: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-channel (per-row) scale + zero point mapping values to [0, 2^bits-1]."""
+    q_min = 0
+    q_max = (1 << bits) - 1
+    # For each column (channel): find its smallest and largest value
+    x_min = x.min(dim=1).values
+    x_max = x.max(dim=1).values
+    # 0-15 marks
+    scale = (x_max - x_min) / (q_max - q_min)
+    # find mark for 0.0
+    zero_point = q_min - torch.round(x_min / scale)
+    # a col where max and min are same
+    is_constant = x_max == x_min
+    scale = torch.where(is_constant, torch.ones_like(scale), scale)
+    zero_point = torch.where(is_constant, torch.zeros_like(zero_point), zero_point)
+    zero_point = zero_point.clamp(q_min, q_max)
+    return scale.half(), zero_point.half()
+
+
+def quantize_tensor(x, scale, zero_point, bits=4):
+    """Quantize + pack pairs of dims into single bytes (2 nibbles per byte)."""
+    q_max = (1 << bits) - 1
+    scale = scale.unsqueeze(1)
+    zero_point = zero_point.unsqueeze(1)
+    q = torch.round(x / scale) + zero_point
+    q = q.clamp(0, q_max)
+    q = q.to(torch.uint8)
+    # pack pairs of tags into single bytes
+    q = q.view(x.shape[0], x.shape[1], x.shape[2] // 2, 2)
+    packed = q[..., 0] | (q[..., 1] << 4)
+    return packed
+
+
+def dequantize_tensor(packed, scale, zero_point, bits=4):
+    """Dequantize a packed tensor (reference for correctness checks)."""
+    evens = packed & 0x0F
+    odds = (packed >> 4) & 0x0F
+    q = torch.stack([evens, odds], dim=-1).view(packed.shape[0], packed.shape[1], -1)
+    scale = scale.unsqueeze(1)
+    zero_point = zero_point.unsqueeze(1)
+    return (q.float() - zero_point.float()) * scale.float()
+
+
+def quantize_kv(k, v, bits_k=4, bits_v=4):
+    k_scale, k_zero = compute_scale_zero(k, bits_k)
+    k_packed = quantize_tensor(k, k_scale, k_zero, bits_k)
+    v_scale, v_zero = compute_scale_zero(v, bits_v)
+    v_packed = quantize_tensor(v, v_scale, v_zero, bits_v)
+    return k_packed, k_scale, k_zero, v_packed, v_scale, v_zero
 
 
 def report(section, line):
@@ -118,10 +174,10 @@ def op_level():
 
 
 # ---------------------------------------------------------------------------
-# Section 3: model-level TinyLlama (interleaved, quality + throughput)
+# Section 3: model-level (interleaved, quality + throughput)
 # ---------------------------------------------------------------------------
 
-MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"   # overridable via --model
 PROMPT = ("The history of Paris spans over two thousand years. It grew into one of the "
           "most influential cities in Europe, known for its art, its cuisine and its "
           "architecture. Today its most famous landmark is")
@@ -334,11 +390,14 @@ def vllm_section():
 # ---------------------------------------------------------------------------
 
 def main():
+    global MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--op-only", action="store_true")
     ap.add_argument("--model-only", action="store_true")
     ap.add_argument("--vllm", action="store_true", help="include vLLM baseline (needs vLLM importable)")
+    ap.add_argument("--model", default=MODEL, help="HuggingFace model id for the model-level section")
     args = ap.parse_args()
+    MODEL = args.model
 
     if not torch.cuda.is_available():
         raise SystemExit("No CUDA GPU — run on the GTX 1650 box.")

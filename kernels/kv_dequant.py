@@ -1,287 +1,257 @@
-# a byte can hold 8 bits means 4, 4 two separte channnel;s thats why even and odd jkust anming 
+# =============================================================================
+#  kernels/kv_dequant.py
+#
+#  Fused 4-bit KV-quantized attention kernels — CUDA.
+#
+#  The device code lives right here in the kernels package:
+#
+#      kernels/kv_dequant_kernels.cuh   # the __global__ kernels (pure CUDA)
+#      kernels/kv_dequant_cuda.cu       # torch bindings + launch wrappers
+#
+#  This file is the Python API for all kernels:
+#
+#      kv_dequant_decode_attention(...)                -> [H, 1, D] fp32
+#      kv_dequant_prefill_attention(...)               -> [H, M, D] fp32
+#      kv_dequant_decode_per_token_attention(...)      -> [H, 1, D] fp32
+#      kv_dequant_decode_per_token_paged_attention(...)-> [H, 1, D] fp32
+#      kv_quantize_store(...)                          -> None (writes cache)
+#
+#  The first two are per-channel (used by the standalone benchmark); the
+#  per-token + paged variants and the store kernel power the native packed
+#  4-bit KV cache inside the vLLM adapter (adapters/vllm_adapter.py).
+#
+#  WHY JIT COMPILE (instead of shipping a prebuilt .so):
+#  The extension is compiled with torch.utils.cpp_extension.load_inline() on
+#  first import and cached under ~/.cache/torch_extensions. This mirrors JIT
+#  kernel-compilation behavior: the first call is slow (nvcc build), subsequent
+#  runs load the cached binary in milliseconds. It also means no packaging
+#  changes and no prebuilt wheels for every torch/CUDA combination.
+#
+#  BUILD REQUIREMENTS: nvcc + a CUDA toolkit. If the build fails (no nvcc, no
+#  torch CUDA), importing this module raises; callers such as
+#  adapters/vllm_adapter.py catch import errors and degrade gracefully.
+# =============================================================================
+from __future__ import annotations
+
+from pathlib import Path
+
 import torch
-import triton
-import triton.language as tl
+
+_HERE = Path(__file__).resolve().parent
+_EXT_NAME = "slm_turbo_kv_dequant_cuda"
+
+_ext = None
+_ext_error: Exception | None = None
 
 
-@triton.jit
-def kv_dequant_decode_kernel(
-    q_ptr,            # query tokens 
-    k_packed_ptr,     # [H,S,D//2]as 2 ,4 bits packed
-    k_scale_ptr,      # fp16 per channel
-    k_zero_ptr,       # fp16 per channel
-    v_packed_ptr,     # 2 , 4 channels packed 
-    v_scale_ptr,      # fp16
-    v_zero_ptr,       # fp16
-    out_ptr,          # [H, 1, D] fp32 output
-    S,                # no of kv tokens
-    D: tl.constexpr,           # head_dim
-    BLOCK_D: tl.constexpr,     # padded head_dim 
-    BLOCK_D2: tl.constexpr,    # padded packed dimension (BLOCK_D // 2)
-    BLOCK_N: tl.constexpr,     # KV chunk size like 64/128
-    USE_QUANT: tl.constexpr,   # bool: False -> plain attention
-    GROUPS: tl.constexpr,      # query_heads // kv_heads (1 = MHA, >1 = GQA/MQA)
-):
-    head = tl.program_id(0)
-    kv_head = head // GROUPS   # GQA: query head maps to its group's KV head
+def _load_cuda_extension():
+    """Build (or load from cache) the CUDA extension. Idempotent."""
+    global _ext, _ext_error
+    if _ext is not None:
+        return _ext
+    if _ext_error is not None:
+        raise _ext_error  # re-raise the original failure with its traceback
 
-    d_idx = tl.arange(0, BLOCK_D)
-    d2_idx = tl.arange(0, BLOCK_D2)
+    from torch.utils.cpp_extension import load_inline
 
-    # Load the query 
-    q = tl.load(q_ptr + head * D + d_idx, mask=d_idx < D, other=0.0)
-    q = q.to(tl.float32)[None, :]               # [1, BLOCK_D]
-
-    # Load this head's rulers 
-    if USE_QUANT:
-        d2_mask = d2_idx < (D // 2)
-        s_k_even = tl.load(k_scale_ptr + kv_head * D + d2_idx * 2,     mask=d2_mask, other=0.0).to(tl.float32)
-        z_k_even = tl.load(k_zero_ptr + kv_head * D + d2_idx * 2,      mask=d2_mask, other=0.0).to(tl.float32)
-        s_k_odd = tl.load(k_scale_ptr + kv_head * D + d2_idx * 2 + 1,  mask=d2_mask, other=0.0).to(tl.float32)
-        z_k_odd = tl.load(k_zero_ptr + kv_head * D + d2_idx * 2 + 1,   mask=d2_mask, other=0.0).to(tl.float32)
-        s_v_even = tl.load(v_scale_ptr + kv_head * D + d2_idx * 2,     mask=d2_mask, other=0.0).to(tl.float32)
-        z_v_even = tl.load(v_zero_ptr + kv_head * D + d2_idx * 2,      mask=d2_mask, other=0.0).to(tl.float32)
-        s_v_odd = tl.load(v_scale_ptr + kv_head * D + d2_idx * 2 + 1,  mask=d2_mask, other=0.0).to(tl.float32)
-        z_v_odd = tl.load(v_zero_ptr + kv_head * D + d2_idx * 2 + 1,   mask=d2_mask, other=0.0).to(tl.float32)
+    # Pick the right gencode for the GPU actually present; without a GPU,
+    # default to the project's stress-test target (GTX 1650 = sm_75, plus
+    # sm_80 for newer cards). SLM_TURBO_CUDA_ARCH overrides everything.
+    cuda_flags = ["-O3", "--expt-relaxed-constexpr"]
+    arch = __import__("os").environ.get("SLM_TURBO_CUDA_ARCH")
+    if arch:
+        cuda_flags.append(f"-gencode=arch=compute_{arch},code=sm_{arch}")
+    elif torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability(0)
+        sm = f"{cap[0]}{cap[1]}"
+        cuda_flags.append(f"-gencode=arch=compute_{sm},code=sm_{sm}")
     else:
-        ones = tl.full([BLOCK_D2], 1.0, tl.float32)
-        zeros = tl.full([BLOCK_D2], 0.0, tl.float32)
-        s_k_even, s_k_odd, s_v_even, s_v_odd = ones, ones, ones, ones
-        z_k_even, z_k_odd, z_v_even, z_v_odd = zeros, zeros, zeros, zeros
+        cuda_flags += [
+            "-gencode=arch=compute_75,code=sm_75",
+            "-gencode=arch=compute_80,code=sm_80",
+        ]
 
-    # Online softmax state
-    acc = tl.zeros([1, BLOCK_D], dtype=tl.float32)
-    m = tl.full([1, 1], float("-inf"), tl.float32)
-    l = tl.zeros([1, 1], dtype=tl.float32)
-
-    kv_base = kv_head * S * (D // 2)             # this kv-head's cache offset
-    scale = 1.0 / (D ** 0.5)
-
-    # Loop over KV history in chunks of BLOCK_N 
-    n_idx = tl.arange(0, BLOCK_N)
-    for start in range(0, S, BLOCK_N):
-        n_offs = start + n_idx
-        n_mask = n_offs < S
-
-        # 5. Load + unpack + dequant K chunk -> [BLOCK_N, BLOCK_D] 
-        k_bytes = tl.load(
-            k_packed_ptr + kv_base + n_offs[:, None] * (D // 2) + d2_idx[None, :],
-            mask=n_mask[:, None] & (d2_idx[None, :] < (D // 2)),
-            other=0,
-        )                                       # [BLOCK_N, BLOCK_D2] uint8
-        k_even = (k_bytes & 0x0F).to(tl.float32)
-        k_odd = ((k_bytes >> 4) & 0x0F).to(tl.float32)
-        k_even = (k_even - z_k_even[None, :]) * s_k_even[None, :]
-        k_odd = (k_odd - z_k_odd[None, :]) * s_k_odd[None, :]
-        k = tl.reshape(tl.join(k_even, k_odd), (BLOCK_N, BLOCK_D))
-        # k[n, 2j] = k_even[n, j]  (low nibble)   k[n, 2j+1] = k_odd[n, j]  (high nibble)
-
-        # Scores + online softmax update 
-        scores = tl.dot(q, tl.trans(k)) * scale  # [1, BLOCK_N]
-        # Mask out-of-range (padding) tokens: -inf -> exp -> 0, no softmax vote
-        scores = tl.where(n_mask[None, :], scores, float("-inf"))
-        chunk_max = tl.max(scores, axis=1)       # [1, 1]
-        new_m = tl.maximum(m, chunk_max)
-        p = tl.exp(scores - new_m)               # [1, BLOCK_N]
-        rescale = tl.exp(m - new_m)              # shrink old accumulation to new scale
-        l = l * rescale + tl.sum(p, axis=1)
-        m = new_m
-
-        # Load + unpack + dequant V chunk 
-        v_bytes = tl.load(
-            v_packed_ptr + kv_base + n_offs[:, None] * (D // 2) + d2_idx[None, :],
-            mask=n_mask[:, None] & (d2_idx[None, :] < (D // 2)),
-            other=0,
-        )                                       # [BLOCK_N, BLOCK_D2] uint8
-        v_even = (v_bytes & 0x0F).to(tl.float32)
-        v_odd = ((v_bytes >> 4) & 0x0F).to(tl.float32)
-        v_even = (v_even - z_v_even[None, :]) * s_v_even[None, :]
-        v_odd = (v_odd - z_v_odd[None, :]) * s_v_odd[None, :]
-        v = tl.reshape(tl.join(v_even, v_odd), (BLOCK_N, BLOCK_D))
-
-        # Accumulate (rescale old acc to new max scale, like l above)
-        acc = acc * rescale + tl.dot(p, v)       # [1, BLOCK_D]
-
-    # Normalize and store 
-    out = acc / l
-    out1d = tl.reshape(out, (BLOCK_D,))
-    tl.store(out_ptr + head * D + d_idx, out1d, mask=d_idx < D)
+    try:
+        _ext = load_inline(
+            name=_EXT_NAME,
+            cpp_sources=["// CUDA bindings live in the .cu file (see kernels/)."],
+            cuda_sources=[(_HERE / "kv_dequant_cuda.cu").read_text()],
+            extra_include_paths=[str(_HERE)],
+            extra_cuda_cflags=cuda_flags,
+            verbose=False,
+        )
+    except Exception as e:  # pragma: no cover - depends on build environment
+        _ext_error = e
+        raise
+    return _ext
 
 
+# =============================================================================
+#  DECODE attention
+# =============================================================================
 def kv_dequant_decode_attention(
     q, k_packed, k_scale, k_zero, v_packed, v_scale, v_zero,
     BLOCK_N=64, use_quant=True, num_kv_heads=None,
 ):
-    """Launch the decode kernel. Returns [H, 1, D] fp32. GQA: k/v have num_kv_heads rows."""
+    """Run the fused 4-bit decode kernel. Returns [H, 1, D] fp32.
+
+    Args:
+        q:         [H, 1, D] fp16 query tokens (one per head, decode step).
+        k_packed:  [KV, S, D//2] uint8 packed 4-bit keys.
+        k_scale:   [KV, D] fp16 per-channel key scales.
+        k_zero:    [KV, D] fp16 per-channel key zero points.
+        v_packed:  [KV, S, D//2] uint8 packed 4-bit values.
+        v_scale:   [KV, D] fp16 per-channel value scales.
+        v_zero:    [KV, D] fp16 per-channel value zero points.
+        BLOCK_N:   KV chunk size (32 or 64) — the kernel loops over S in these.
+        use_quant: True -> dequantize (nibble - z) * s; False -> raw nibbles.
+        num_kv_heads: KV count if q uses GQA; defaults to k_packed.shape[0].
+    """
     H, _, D = q.shape
     KV, S, D2 = k_packed.shape
     assert D == D2 * 2, f"D {D} != 2*D2 {D2}"
+    assert D in (64, 80, 128), f"head_dim must be 64/80/128, got {D}"
+    assert BLOCK_N in (32, 64), f"BLOCK_N must be 32 or 64, got {BLOCK_N}"
     num_kv_heads = KV if num_kv_heads is None else num_kv_heads
     assert H % num_kv_heads == 0, f"H {H} not divisible by num_kv_heads {num_kv_heads}"
-    groups = H // num_kv_heads
-    BLOCK_D = triton.next_power_of_2(D)
     assert q.shape == (H, 1, D), f"q {q.shape} != {(H, 1, D)}"
-    out = torch.zeros((H, 1, D), dtype=torch.float32, device=q.device)
-    grid = (H,)
-    kv_dequant_decode_kernel[grid](
-        q, k_packed, k_scale, k_zero, v_packed, v_scale, v_zero, out,
-        S, D, BLOCK_D, BLOCK_D // 2, BLOCK_N, use_quant, groups,
-        num_warps=4,
-    )
-    return out
 
-
-# ---------------------------------------------------------------------------
-# PREFILL kernel: many query tokens at once [H, M, D], causal mask.
-# Same online-softmax math as the decode kernel, but each program handles a
-# (head, BLOCK_M query block) pair and each query row attends to j <= i.
-# ---------------------------------------------------------------------------
-
-@triton.jit
-def kv_dequant_prefill_kernel(
-    q_ptr,            # [H, M, D] fp16 queries
-    k_packed_ptr,     # [H, S, D//2] packed 4-bit keys
-    k_scale_ptr,      # fp16 per channel
-    k_zero_ptr,       # fp16 per channel
-    v_packed_ptr,     # [H, S, D//2] packed 4-bit values
-    v_scale_ptr,      # fp16 per channel
-    v_zero_ptr,       # fp16 per channel
-    out_ptr,          # [H, M, D] fp32 output
-    M,                # number of query tokens
-    S,                # number of KV tokens
-    D: tl.constexpr,           # head_dim
-    BLOCK_D: tl.constexpr,     # padded head_dim
-    BLOCK_D2: tl.constexpr,    # padded packed dim (BLOCK_D // 2)
-    BLOCK_M: tl.constexpr,     # query tokens per program
-    BLOCK_N: tl.constexpr,     # KV chunk size
-    CAUSAL: tl.constexpr,      # bool: mask out future tokens
-    USE_QUANT: tl.constexpr,   # bool: False -> plain attention
-    GROUPS: tl.constexpr,      # query_heads // kv_heads (1 = MHA, >1 = GQA/MQA)
-):
-    pid = tl.program_id(0)
-    num_m_blocks = tl.cdiv(M, BLOCK_M)
-    head = pid // num_m_blocks
-    kv_head = head // GROUPS   # GQA: query head maps to its group's KV head
-    m_block = pid % num_m_blocks
-    m_start = m_block * BLOCK_M
-
-    m_idx = m_start + tl.arange(0, BLOCK_M)  # [BLOCK_M] query rows
-    d_idx = tl.arange(0, BLOCK_D)
-    d2_idx = tl.arange(0, BLOCK_D2)
-    m_mask = m_idx < M
-
-    # Load this program's query block -> [BLOCK_M, BLOCK_D]
-    q = tl.load(
-        q_ptr + head * M * D + m_idx[:, None] * D + d_idx[None, :],
-        mask=m_mask[:, None] & (d_idx[None, :] < D),
-        other=0.0,
-    )
-    q = q.to(tl.float32)
-
-    # Per-channel rulers (same as decode kernel)
-    if USE_QUANT:
-        d2_mask = d2_idx < (D // 2)
-        s_k_even = tl.load(k_scale_ptr + kv_head * D + d2_idx * 2,     mask=d2_mask, other=0.0).to(tl.float32)
-        z_k_even = tl.load(k_zero_ptr + kv_head * D + d2_idx * 2,      mask=d2_mask, other=0.0).to(tl.float32)
-        s_k_odd = tl.load(k_scale_ptr + kv_head * D + d2_idx * 2 + 1,  mask=d2_mask, other=0.0).to(tl.float32)
-        z_k_odd = tl.load(k_zero_ptr + kv_head * D + d2_idx * 2 + 1,   mask=d2_mask, other=0.0).to(tl.float32)
-        s_v_even = tl.load(v_scale_ptr + kv_head * D + d2_idx * 2,     mask=d2_mask, other=0.0).to(tl.float32)
-        z_v_even = tl.load(v_zero_ptr + kv_head * D + d2_idx * 2,      mask=d2_mask, other=0.0).to(tl.float32)
-        s_v_odd = tl.load(v_scale_ptr + kv_head * D + d2_idx * 2 + 1,  mask=d2_mask, other=0.0).to(tl.float32)
-        z_v_odd = tl.load(v_zero_ptr + kv_head * D + d2_idx * 2 + 1,   mask=d2_mask, other=0.0).to(tl.float32)
-    else:
-        ones = tl.full([BLOCK_D2], 1.0, tl.float32)
-        zeros = tl.full([BLOCK_D2], 0.0, tl.float32)
-        s_k_even, s_k_odd, s_v_even, s_v_odd = ones, ones, ones, ones
-        z_k_even, z_k_odd, z_v_even, z_v_odd = zeros, zeros, zeros, zeros
-
-    # Online softmax state, one row per query token
-    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
-    m = tl.full([BLOCK_M, 1], float("-inf"), tl.float32)
-    l = tl.zeros([BLOCK_M, 1], dtype=tl.float32)
-
-    kv_base = kv_head * S * (D // 2)   # this kv-head's cache offset
-    scale = 1.0 / (D ** 0.5)
-
-    n_idx = tl.arange(0, BLOCK_N)
-    for start in range(0, S, BLOCK_N):
-        n_offs = start + n_idx
-        n_mask = n_offs < S
-
-        # valid cell = real row & real column & (causal: query >= kv index)
-        valid = m_mask[:, None] & n_mask[None, :]
-        if CAUSAL:
-            valid = valid & (m_idx[:, None] >= n_offs[None, :])
-
-        # Load + unpack + dequant K chunk -> [BLOCK_N, BLOCK_D]
-        k_bytes = tl.load(
-            k_packed_ptr + kv_base + n_offs[:, None] * (D // 2) + d2_idx[None, :],
-            mask=n_mask[:, None] & (d2_idx[None, :] < (D // 2)),
-            other=0,
-        )
-        k_even = (k_bytes & 0x0F).to(tl.float32)
-        k_odd = ((k_bytes >> 4) & 0x0F).to(tl.float32)
-        k_even = (k_even - z_k_even[None, :]) * s_k_even[None, :]
-        k_odd = (k_odd - z_k_odd[None, :]) * s_k_odd[None, :]
-        k = tl.reshape(tl.join(k_even, k_odd), (BLOCK_N, BLOCK_D))
-
-        # Scores -> apply mask (-inf on forbidden/phantom cells)
-        scores = tl.dot(q, tl.trans(k)) * scale   # [BLOCK_M, BLOCK_N]
-        scores = tl.where(valid, scores, float("-inf"))
-
-        chunk_max = tl.max(scores, axis=1, keep_dims=True)  # [BLOCK_M, 1]
-        new_m = tl.maximum(m, chunk_max)
-        p = tl.exp(scores - new_m)                # [BLOCK_M, BLOCK_N]
-        rescale = tl.exp(m - new_m)               # [BLOCK_M, 1]
-        l = l * rescale + tl.sum(p, axis=1, keep_dims=True)
-        m = new_m
-
-        # Load + unpack + dequant V chunk
-        v_bytes = tl.load(
-            v_packed_ptr + kv_base + n_offs[:, None] * (D // 2) + d2_idx[None, :],
-            mask=n_mask[:, None] & (d2_idx[None, :] < (D // 2)),
-            other=0,
-        )
-        v_even = (v_bytes & 0x0F).to(tl.float32)
-        v_odd = ((v_bytes >> 4) & 0x0F).to(tl.float32)
-        v_even = (v_even - z_v_even[None, :]) * s_v_even[None, :]
-        v_odd = (v_odd - z_v_odd[None, :]) * s_v_odd[None, :]
-        v = tl.reshape(tl.join(v_even, v_odd), (BLOCK_N, BLOCK_D))
-
-        acc = acc * rescale + tl.dot(p, v)        # [BLOCK_M, BLOCK_D]
-
-    # Normalize and store [BLOCK_M, BLOCK_D]
-    out = acc / l
-    tl.store(
-        out_ptr + head * M * D + m_idx[:, None] * D + d_idx[None, :],
-        out,
-        mask=m_mask[:, None] & (d_idx[None, :] < D),
+    ext = _load_cuda_extension()
+    return ext.kv_dequant_decode_attention_cuda(
+        q, k_packed, k_scale, k_zero, v_packed, v_scale, v_zero,
+        BLOCK_N, use_quant, num_kv_heads,
     )
 
 
+# =============================================================================
+#  PREFILL attention
+# =============================================================================
 def kv_dequant_prefill_attention(
     q, k_packed, k_scale, k_zero, v_packed, v_scale, v_zero,
-    BLOCK_M=None, BLOCK_N=64, causal=True, use_quant=True, num_kv_heads=None,
+    BLOCK_M=None, BLOCK_N=None, causal=True, use_quant=True, num_kv_heads=None,
 ):
-    """Launch the prefill kernel. Returns [H, M, D] fp32. GQA: k/v have num_kv_heads rows."""
+    """Run the fused 4-bit prefill kernel. Returns [H, M, D] fp32.
+
+    Args:
+        q:         [H, M, D] fp16 query tokens.
+        k_packed:  [KV, S, D//2] uint8 packed 4-bit keys.
+        k_scale:   [KV, D] fp16 per-channel key scales.
+        k_zero:    [KV, D] fp16 per-channel key zero points.
+        v_packed:  [KV, S, D//2] uint8 packed 4-bit values.
+        v_scale:   [KV, D] fp16 per-channel value scales.
+        v_zero:    [KV, D] fp16 per-channel value zero points.
+        BLOCK_M:   query rows per block (16/32). Default: 32 for D=64, else 16
+                   (larger tiles exceed the 48 KB shared-memory budget).
+        BLOCK_N:   KV chunk size (32/64). Default: 64 for D=64, else 32.
+        causal:    mask out future KV tokens (True for autoregressive prefill).
+        use_quant: True -> dequantize; False -> raw nibbles.
+        num_kv_heads: KV count if q uses GQA; defaults to k_packed.shape[0].
+    """
     H, M, D = q.shape
     KV, S, D2 = k_packed.shape
     assert D == D2 * 2, f"D {D} != 2*D2 {D2}"
+    assert D in (64, 80, 128), f"head_dim must be 64/80/128, got {D}"
     assert q.device == k_packed.device
     num_kv_heads = KV if num_kv_heads is None else num_kv_heads
     assert H % num_kv_heads == 0, f"H {H} not divisible by num_kv_heads {num_kv_heads}"
-    groups = H // num_kv_heads
-    BLOCK_D = triton.next_power_of_2(D)
-    # shared memory: [BLOCK_M, BLOCK_D] tiles are fp32; keep BLOCK_M small for big D.
-    # GTX 1650 (14 SMs): smaller tiles -> more CTAs -> better SM occupancy (2x faster than BLOCK_M=64).
+
+    # Shared-memory budget limits how big the tiles can be for D >= 80, and
+    # measured on the GTX 1650 the sweet spot is a tall-ish (16, 64) tile for
+    # D=64 and (16, 32) for larger head_dims.
     if BLOCK_M is None:
-        BLOCK_M = 32
-    out = torch.zeros((H, M, D), dtype=torch.float32, device=q.device)
-    num_m_blocks = triton.cdiv(M, BLOCK_M)
-    grid = (H * num_m_blocks,)
-    kv_dequant_prefill_kernel[grid](
-        q, k_packed, k_scale, k_zero, v_packed, v_scale, v_zero, out,
-        M, S, D, BLOCK_D, BLOCK_D // 2, BLOCK_M, BLOCK_N, causal, use_quant, groups,
-        num_warps=4, num_stages=1,
+        BLOCK_M = 16
+    if BLOCK_N is None:
+        BLOCK_N = 64 if D == 64 else 32
+    assert BLOCK_M in (16, 32), f"BLOCK_M must be 16 or 32, got {BLOCK_M}"
+    assert BLOCK_N in (32, 64), f"BLOCK_N must be 32 or 64, got {BLOCK_N}"
+    if D != 64:
+        assert (BLOCK_M, BLOCK_N) == (16, 32), (
+            f"head_dim {D}: only (BLOCK_M=16, BLOCK_N=32) fits the "
+            f"48 KB shared budget; got ({BLOCK_M}, {BLOCK_N})"
+        )
+
+    ext = _load_cuda_extension()
+    return ext.kv_dequant_prefill_attention_cuda(
+        q, k_packed, k_scale, k_zero, v_packed, v_scale, v_zero,
+        BLOCK_M, BLOCK_N, causal, use_quant, num_kv_heads,
     )
-    return out
+
+
+# =============================================================================
+#  PER-TOKEN DECODE attention  (vLLM packed-cache integration)
+# =============================================================================
+#  Variant of the decode kernel that uses per-token (min, step) rulers instead
+#  of per-channel scales. This is what the vLLM adapter stores in its packed
+#  4-bit cache: each token's K/V is quantized with its OWN min/max at write
+#  time (do_kv_cache_update), so there is no ruler drift and no need to
+#  re-quantize on read.
+# =============================================================================
+def kv_dequant_decode_per_token_attention(
+    q, k_packed, k_min, k_step, v_packed, v_min, v_step,
+    BLOCK_N=64, num_kv_heads=None,
+):
+    """Run the per-token decode kernel. Returns [H, 1, D] fp32.
+
+    Args:
+        q:         [H, 1, D] fp16 query tokens.
+        k_packed:  [KV, S, D//2] uint8 packed 4-bit keys.
+        k_min:     [KV, S] fp16 per-token key min.
+        k_step:    [KV, S] fp16 per-token key step ((max-min)/15).
+        v_packed:  [KV, S, D//2] uint8 packed 4-bit values.
+        v_min:     [KV, S] fp16 per-token value min.
+        v_step:    [KV, S] fp16 per-token value step.
+        BLOCK_N:   KV chunk size (32 or 64).
+        num_kv_heads: KV count if q uses GQA; defaults to k_packed.shape[0].
+    """
+    H, _, D = q.shape
+    KV, S, D2 = k_packed.shape
+    assert D == D2 * 2, f"D {D} != 2*D2 {D2}"
+    assert D in (64, 80, 128), f"head_dim must be 64/80/128, got {D}"
+    assert BLOCK_N in (32, 64), f"BLOCK_N must be 32 or 64, got {BLOCK_N}"
+    num_kv_heads = KV if num_kv_heads is None else num_kv_heads
+    assert H % num_kv_heads == 0, f"H {H} not divisible by num_kv_heads {num_kv_heads}"
+
+    ext = _load_cuda_extension()
+    return ext.kv_dequant_decode_per_token_attention_cuda(
+        q, k_packed, k_min, k_step, v_packed, v_min, v_step, BLOCK_N, num_kv_heads,
+    )
+
+
+def kv_quantize_store(key, value, kv_cache, slot_mapping, block_size):
+    """Quantize-on-write: pack fp16 K/V rows into the 4-bit cache slots.
+
+    Args:
+        key:         [N, KV, D] fp16 keys (N tokens in the write batch).
+        value:       [N, KV, D] fp16 values.
+        kv_cache:    [num_blocks, block_size, KV, D+8] uint8 packed cache.
+        slot_mapping: [N] int64 — flat slot per token (block*block_size + pos).
+        block_size:  vLLM's KV block size.
+    """
+    assert key.dim() == 3, f"key must be [N, KV, D], got {key.shape}"
+    assert kv_cache.is_contiguous(), "kv_cache must be contiguous"
+    ext = _load_cuda_extension()
+    ext.kv_quantize_store_cuda(key, value, kv_cache, slot_mapping, block_size)
+
+
+def kv_dequant_decode_per_token_paged_attention(
+    q, kv_cache, block_table, seq_len, block_size, num_kv_heads,
+):
+    """Paged per-token decode: reads the packed 4-bit cache directly via the
+    request's block_table (no host-side gather). Returns [H, 1, D] fp32.
+
+    Args:
+        q:          [H, 1, D] fp16 query tokens.
+        kv_cache:   [num_blocks, block_size, KV, D+8] uint8 packed cache.
+        block_table: [max_blocks] int64 — this request's physical block ids.
+        seq_len:    number of KV tokens for this request.
+        block_size: vLLM's KV block size.
+        num_kv_heads: number of KV heads (KV).
+    """
+    H, _, D = q.shape
+    assert D in (64, 80, 128), f"head_dim must be 64/80/128, got {D}"
+    assert H % num_kv_heads == 0, f"H {H} not divisible by num_kv_heads {num_kv_heads}"
+    assert kv_cache.size(-1) == D + 8, f"cache slot must be D+8, got {kv_cache.size(-1)}"
+    ext = _load_cuda_extension()
+    return ext.kv_dequant_decode_per_token_paged_attention_cuda(
+        q, kv_cache, block_table, seq_len, block_size, num_kv_heads,
+    )
