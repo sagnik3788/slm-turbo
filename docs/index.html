@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SLM Turbo — Automated LLM inference optimization</title>
+  <meta name="description" content="SLM Turbo profiles your GPU, diagnoses bottlenecks with a roofline model, and generates a GPU-specific recipe. Tested on GTX 1650 (sm_75, 4GB) — 4.74× decode speedup, 3.56× context.">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23ffffff' stroke='%230B0F1A' stroke-width='1.5'/%3E%3Ctext x='50%25' y='56%25' dominant-baseline='middle' text-anchor='middle' font-family='monospace' font-size='26' font-weight='800' fill='%230B0F1A'%3EST%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <meta property="og:title" content="SLM Turbo — Profile and auto-tune local AI for your specific GPU">
+  <meta property="og:description" content="Automated diagnosis + GPU-specific recipe generation. Not flags — why it's slow and what to fix. 4.74× decode, 3.56× context on GTX 1650.">
+  <meta property="og:type" content="website">
+  <meta property="og:image" content="arch.png">
+  <meta property="og:url" content="https://sagnik3788.github.io/slm-turbo/">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="SLM Turbo">
+  <meta name="twitter:description" content="Profile. Diagnose. Prescribe. A recipe, not 50 knobs.">
+  <meta name="twitter:image" content="arch.png">
+</head>
+<body>
+  <header class="site-nav" aria-label="Primary">
+    <div class="nav-inner">
+      <a class="brand" href="#"><span class="brand-mark">ST</span> SLM Turbo</a>
+      <nav class="nav-links" aria-label="Sections">
+        <a href="#problem">Problem</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="#cli">CLI</a>
+        <a href="#stack">Stack</a>
+        <a href="#getting-started">Get started</a>
+      </nav>
+      <a class="nav-cta" href="https://github.com/sagnik3788/slm-turbo" target="_blank" rel="noopener">GitHub →</a>
+    </div>
+  </header>
+
+  <!-- Hero — PLAIN WHITE MINIMAL -->
+  <div class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Automated LLM inference optimization <span class="eyebrow-dot" aria-hidden="true"></span> v1 · Linux · CUDA 11.8 / 12.x</p>
+      <h1>Profile and<br>auto-tune <em>local AI</em><br>for your specific GPU.</h1>
+      <p class="lede">SLM Turbo profiles your model and your GPU, classifies the bottleneck with a roofline model, and prescribes targeted fixes.</p>
+      <p class="sub">Most serving tools expose 50+ tuning knobs and leave you guessing. We <strong>measure, model, and prescribe</strong> — then emit a versioned <span class="mono">Recipe</span> that plugs into vLLM without forking it.</p>
+
+      <div class="hero-meta">
+        <span>NVIDIA Turing+ (sm_75) — GTX 1650 stress-tested</span><span class="sep"></span>
+        <span>1B–70B+ · any HF transformer · VLM aware</span><span class="sep"></span>
+        <span>Python 3.9–3.12</span>
+      </div>
+
+      <div class="cta-row">
+        <a class="btn" href="#getting-started">Get started →</a>
+        <a class="btn btn-ghost" href="https://github.com/sagnik3788/slm-turbo" target="_blank" rel="noopener">View on GitHub</a>
+      </div>
+
+      <div class="figure" role="figure" aria-label="Terminal example">
+        <div class="figure-head"><span><span class="dots"><i></i><i></i><i></i></span></span><span>slm-turbo analyze</span></div>
+        <pre><code>pip install slm-turbo
+slm-turbo analyze --model meta-llama/Llama-2-7b-hf
+<span class="c"># Topology: 4096 hidden, 32 heads, 32 layers</span>
+<span class="c"># GPU: GTX 1650 (sm_75, 4GB VRAM)</span>
+<span class="c"># Bottleneck: memory-bound (decode) — 2.1 GB KV cache at 4096 tokens</span>
+<span class="c"># Recommendation: KV quantization + chunked prefill</span></code></pre>
+      </div>
+      <p class="caption">Analytical by default (no model load). Empirical forward-pass when the model fits VRAM.</p>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <main>
+      <!-- Problem -->
+      <section id="problem">
+        <div class="section-label">01 — Problem</div>
+        <h2>Different hardware, <em>different bottlenecks.</em></h2>
+        <p>Prefill is <strong>compute-bound</strong> (large matmuls). Decode is <strong>memory-bandwidth-bound</strong> (small kernels + huge KV reads). The same model needs a different recipe on a GTX 1650 and an A100. Shipping one config to all GPUs leaves performance on the table — or OOMs the small ones.</p>
+        <p class="muted">SLM Turbo fixes the diagnosis gap. Not 50 knobs — one measured answer: why it's slow on <em>your</em> GPU and what to apply.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Phase</th><th>Bound</th><th>What hurts</th><th>What helps</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Prefill</strong></td><td>Compute</td><td>Large matmuls, attention occupancy</td><td>FlashAttention-2 (sm_80+), SDPA fallback</td></tr>
+              <tr><td><strong>Decode</strong></td><td>Memory bandwidth</td><td>KV cache reads every token</td><td>4-bit packed KV, prefix cache, backend choice</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <strong>Design principle:</strong> optimizations are <em>data</em>, not code paths. Every optimizer emits a declarative <code>Recipe</code> (Pydantic). A run is <code>{baseline_profile, recipe, applied_profile, delta}</code> — versioned, validated, git-diffable.
+        </div>
+        <ul>
+          <li><strong>Model-agnostic via topology.</strong> <code>ModelTopology</code> from <code>config.json</code> alone — heads, GQA/MQA, head_dim, layers. Never a model name.</li>
+          <li><strong>GPU-agnostic via capability.</strong> <code>DeviceProfile</code> probes sm, bandwidth, VRAM, tensor cores. Gates are capability checks, not GPU names.</li>
+          <li><strong>vLLM as a library, not a fork.</strong> Only <code>adapters/vllm_adapter.py</code> knows vLLM. Two injection points.</li>
+        </ul>
+      </section>
+
+      <!-- What it does -->
+      <section id="what">
+        <div class="section-label">02 — What it does</div>
+        <h2>Four optimizers. <em>One decision per (model, GPU).</em></h2>
+        <p>Each gates itself with <code>can_apply(topology, device)</code>. No hard-coded names — measured thresholds only.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th style="width:26%">Optimizer</th><th>What it changes</th><th style="width:30%">When it applies</th></tr></thead>
+            <tbody>
+              <tr><td><strong>KV Quantization</strong><br><span class="small">asymmetric 4-bit K / 2–4-bit V</span></td><td>Cuts KV memory. Dequant in registers during attention — never writes fp16 back to DRAM. Block 64/128 tuned per bandwidth.</td><td>VRAM &lt;8 GB or KV &gt;50% VRAM. Decode only.</td></tr>
+              <tr><td><strong>Prefix Cache</strong><br><span class="small">radix-style</span></td><td>Hashes prompts, skips prefill for repeated prefixes. LRU eviction.</td><td>≤80 layers · chat / repeated system prompts</td></tr>
+              <tr><td><strong>Chunked Prefill</strong></td><td>Splits long prefill 512/1024, interleaves with decode.</td><td>Contexts &gt;4096. Always safe.</td></tr>
+              <tr><td><strong>Attention Backend</strong></td><td>Selects FA2, custom Triton, or SDPA per device + head_dim.</td><td>FA2 on sm_80+ TCC · Triton sm_75+ · SDPA fallback</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout"><strong>Safety gate:</strong> 100-token perplexity check. If delta &gt;5%, step disabled with warning. Every path has a fallback.</div>
+      </section>
+
+      <!-- Architecture — centerpiece -->
+      <section id="architecture">
+        <div class="section-label">03 — Architecture</div>
+        <h2>Layered. <em>Isolated at the adapter.</em></h2>
+        <p>Data flows top to bottom; isolation flows bottom to top. If vLLM's API changes, only one file breaks. Below is the actual system diagram — not a mock.</p>
+
+        <figure class="arch-figure" aria-label="SLM Turbo architecture diagram">
+          <div class="fig-head"><span>System overview — analyze → optimize → warmup → serve</span><span class="fig-badge">DIAGRAM</span></div>
+          <img src="arch.png" alt="SLM Turbo architecture: colorful hand-drawn flow — User → analyze → read HF config + profile GPU → Analyzer (orange) → suggest → optimize → Recipe Engine (green) → create recipe.yaml → tweak configs → warmup → compile kernels → serve → read recipe apply in vLLM adapter → vLLM server" width="1290" height="730" loading="lazy" decoding="async">
+          <figcaption class="fig-cap"><strong>How it runs:</strong> <code>analyze</code> derives topology + device → roofline Analyzer classifies → <code>suggest</code> → <code>optimize</code> via Recipe Engine writes <code>recipe.yaml</code> → tweak configs → <code>warmup</code> compiles Triton kernels → <code>serve</code> reads recipe and injects via <code>vllm_adapter</code> into vLLM server. Two hooks only: <code>AttentionBackend</code> + <code>CacheConfig</code>. No fork.</figcaption>
+        </figure>
+
+        <div class="arch" role="img" aria-label="Layered stack summary">
+          <div class="arch-row"><div class="arch-label">Interfaces</div><div class="arch-content"><span class="pill">CLI — Typer + Rich</span> <em>· Dashboard deferred · API deferred</em></div></div>
+          <div class="arch-row"><div class="arch-label">Orchestrator</div><div class="arch-content">Run lifecycle · recipe execution · snapshot store <em>— SQLite</em></div></div>
+          <div class="arch-row"><div class="arch-label">Engine Core</div><div class="arch-content"><span class="pill">Profiler</span> <span class="pill">Roofline Analyzer</span> <span class="pill">Recipe Engine</span></div></div>
+          <div class="arch-row"><div class="arch-label">Optimizers</div><div class="arch-content"><span class="pill">KV Quant</span> <span class="pill">Prefix Cache</span> <span class="pill">Chunked Prefill</span> <span class="pill">Attention Backend</span></div></div>
+          <div class="arch-row"><div class="arch-label">Adapters</div><div class="arch-content"><span class="pill">vLLM — primary</span> <span class="pill">Mock — tests / CI</span></div></div>
+          <div class="arch-row"><div class="arch-label">Kernels</div><div class="arch-content">Triton · fused KV dequant + attention · layout transforms</div></div>
+          <div class="arch-row"><div class="arch-label">Topology</div><div class="arch-content">HF Config Probe · VLM-aware extensions</div></div>
+          <div class="arch-note">Module layout: <code>slm_turbo/cli.py · engine/ · topology/ · optimizers/ · adapters/ · kernels/triton/</code> — see repo for full tree.</div>
+        </div>
+
+        <h3>Data flow</h3>
+        <div class="flow"><b>1</b> <code>analyze</code> <span class="arrow">→</span> <b>2</b> <code>config.json</code> → <code>ModelTopology</code> <span class="arrow">→</span> <b>3</b> GPU → <code>DeviceProfile</code> <span class="arrow">→</span> <b>4</b> roofline <span class="arrow">→</span> <b>5</b> <code>Recipe</code> <span class="arrow">→</span> <b>6</b> <code>can_apply()</code> <span class="arrow">→</span> <b>7</b> adapter <span class="arrow">→</span> <b>8</b> <code>serve</code></div>
+        <pre><code>slm_turbo/
+├── cli.py
+├── engine/   core.py · profiler.py · roofline.py · recipe.py · snapshot.py
+├── topology/ probe.py · vlm.py
+├── optimizers/ base.py · kv_quant.py · prefix_cache.py · chunked_prefill.py · attention_backend.py
+├── adapters/ base.py · vllm_adapter.py · mock_adapter.py
+└── kernels/triton/ kv_dequant.py · layout.py</code></pre>
+
+        <figure class="img-figure" aria-label="Roofline model">
+          <div class="fig-head" style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#FFFEFC,#F6F1EB);font-family:var(--mono);font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)"><span>Roofline — prefill vs decode</span><span class="fig-badge">MODEL</span></div>
+          <img src="roofline.png" alt="Roofline plot: achievable throughput vs arithmetic intensity, showing memory-bound vs compute-bound regions and ridge point" width="1536" height="1024" loading="lazy" decoding="async">
+          <figcaption class="fig-cap"><strong>Roofline classifier:</strong> arithmetic intensity (FLOPs/byte) vs ridge point (peak compute ÷ bandwidth). Prefill lands compute-bound; decode lands memory-bound — hence different recipes per hardware.</figcaption>
+        </figure>
+      </section>
+
+      <!-- Benchmarks -->
+      <section id="benchmarks">
+        <div class="section-label">04 — Benchmarks</div>
+        <h2>Measured on a <em>GTX 1650.</em> Reproducible.</h2>
+        <p>PyTorch 2.11 + CUDA 13.1 on <strong>GTX 1650 (sm_75, 4 GB, no tensor cores)</strong>. The worst-case GPU is the proof. Reproduce with <code>python kernels/benchmark/benchmark.py</code>.</p>
+
+        <h3>Decode attention — 4-bit packed vs fp16 (op-level)</h3>
+        <p>Decode is memory-bound. 4× less memory per step translates directly to speed. Our hand-written CUDA kernel is <strong>2–4.7× faster than fp16</strong> at the op level.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Seq len</th><th>D=64 kernel</th><th>D=64 fp16</th><th>Speedup</th><th>D=128 kernel</th><th>D=128 fp16</th><th>Speedup</th></tr></thead>
+            <tbody>
+              <tr><td>512</td><td>60.5 µs</td><td>286.5 µs</td><td><strong>4.74×</strong></td><td>171.6 µs</td><td>474.8 µs</td><td>2.77×</td></tr>
+              <tr><td>1024</td><td>136.1 µs</td><td>525.4 µs</td><td>3.86×</td><td>396.3 µs</td><td>908.9 µs</td><td>2.29×</td></tr>
+              <tr><td>2048</td><td>227.8 µs</td><td>967.7 µs</td><td>4.25×</td><td>861.6 µs</td><td>1794.0 µs</td><td>2.08×</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="small">Reproduce: <code>python kernels/benchmark/benchmark.py --op-only</code> · KV per token drops 16–32×: 8 MB → 256 KB at 2048 tokens (D=64, KV=4).</p>
+
+        <figure class="img-figure" aria-label="Decode speedup chart">
+          <img src="decode_speedup.png" alt="Bar chart: decode speedup of 4-bit packed vs fp16 across sequence lengths and head dims" width="1440" height="600" loading="lazy" decoding="async">
+          <figcaption class="fig-cap"><strong>Op-level win:</strong> the 4-bit path compounds as context grows — exactly where small GPUs suffer most.</figcaption>
+        </figure>
+
+        <div class="benchmark-grid">
+          <div class="bench-card"><p class="k">KV capacity (same 0.72 GiB)</p><p class="v">121,456 tokens</p><p class="d">vs 34,160 stock vLLM — <strong>3.56×</strong> with native packed cache</p></div>
+          <div class="bench-card"><p class="k">Long-context win</p><p class="v">2–4.7×</p><p class="d">Op speedup · prefill stays on SDPA (no TCC on sm_75)</p></div>
+        </div>
+
+        <h3>Model-level decode (full model, eager)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Model</th><th>Layers</th><th>Head dim</th><th>Eager fp16</th><th>SLM Turbo 4-bit</th></tr></thead>
+            <tbody>
+              <tr><td>TinyLlama-1.1B-Chat</td><td>22</td><td>64</td><td>49.2 tok/s</td><td>43.8 tok/s (0.89×)</td></tr>
+              <tr><td>Qwen2-0.5B-Instruct</td><td>24</td><td>64</td><td>45.9 tok/s</td><td>38.7 tok/s (0.84×)</td></tr>
+              <tr><td>Qwen2-1.5B-Instruct</td><td>28</td><td>128</td><td>35.4 tok/s</td><td>31.3 tok/s (0.89×)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="small">Reproduce: <code>python kernels/benchmark/benchmark.py --model-only --model TinyLlama/TinyLlama-1.1B-Chat-v1.0</code> · At short context matmuls dominate — the 4-bit win is maximal at long context / op-level.</p>
+
+        <figure class="img-figure" aria-label="Model throughput chart">
+          <img src="model_throughput.png" alt="Chart: model-level throughput TinyLlama and Qwen2 vs eager fp16" width="960" height="540" loading="lazy" decoding="async">
+          <figcaption class="fig-cap"><strong>Honest framing:</strong> ~15% short-context throughput trade for 3.56× context + 2–4.7× long-context speed. Built for small-VRAM GPUs.</figcaption>
+        </figure>
+
+        <div class="callout"><strong>Honest:</strong> the packed backend trades ~15% short-context speed for 3.56× context capacity and long-context decode speed. That's the intended design for 4GB hardware.</div>
+      </section>
+
+      <!-- CLI -->
+      <section id="cli">
+        <div class="section-label">05 — CLI</div>
+        <h2>Offline optimization: <em>analyze → optimize → serve.</em></h2>
+        <p>File-first, git-friendly. Hot-reconfigure deferred for v1.</p>
+        <div class="cli-item">
+          <div class="cli-head"><code>slm-turbo analyze --model &lt;id&gt;</code><span>No model load · analytical</span></div>
+          <div class="cli-body">
+            <p>Downloads <code>config.json</code>, builds topology, probes GPU, runs roofline, prints diagnosis.</p>
+            <pre><code>Model: meta-llama/Llama-2-7b-hf
+Topology: 4096 hidden, 32 heads, 32 layers, GQA=False
+GPU: GTX 1650 (sm_75, 4GB VRAM)
+Bottleneck: Memory-bound (decode phase)
+KV cache: 2.1 GB at 4096 tokens (53% of VRAM)
+Recommendation: Apply KV quantization + chunked prefill</code></pre>
+          </div>
+        </div>
+        <div class="cli-item">
+          <div class="cli-head"><code>slm-turbo optimize --model &lt;id&gt; [--recipe &lt;file&gt;]</code><span>Generates recipe.yaml</span></div>
+          <div class="cli-body">
+            <p>Validates existing or generates new. Saved to <code>~/.slm-turbo/recipes/&lt;model&gt;_&lt;gpu_hash&gt;.yaml</code> with expected deltas.</p>
+            <pre><code>slm-turbo optimize --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+<span class="c"># recipe: kv_quant=on (4-bit K, 4-bit V) · chunked_prefill=1024 · backend=custom_triton</span></code></pre>
+          </div>
+        </div>
+        <div class="cli-item"><div class="cli-head"><code>slm-turbo serve --model &lt;id&gt; --config &lt;file&gt;</code><span>Launches vLLM</span></div><div class="cli-body"><p>Builds <code>CacheConfig</code> + <code>AttentionBackend</code> from recipe, injects adapters, starts vLLM. Metrics on <code>:8000/metrics</code>.</p></div></div>
+        <div class="cli-item"><div class="cli-head"><code>slm-turbo status</code><span>Live metrics</span></div><div class="cli-body"><p>Throughput (tokens/sec) · latency p50/p99 · GPU utilization · KV cache fill · active requests.</p></div></div>
+        <div class="cli-item"><div class="cli-head"><code>slm-turbo warmup --model &lt;id&gt;</code><span>One-time cache</span></div><div class="cli-body"><p>Pre-downloads weights, JIT-compiles Triton to <code>~/.triton/cache/</code>, verifies <code>can_apply()</code>. Next run instant.</p></div></div>
+        <div class="cli-item"><div class="cli-head"><code>slm-turbo doctor</code><span>Environment check</span></div><div class="cli-body"><p>Python 3.9+ · PyTorch + CUDA · sm/VRAM · vLLM &amp; Triton · cache-dir perms · RAM/VRAM.</p></div></div>
+      </section>
+
+      <!-- Stack -->
+      <section id="stack">
+        <div class="section-label">06 — Stack</div>
+        <h2>Small surface. <em>Standard tools.</em></h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Component</th><th>Version</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td>Python</td><td>3.9+</td><td>Primary language</td></tr>
+              <tr><td>PyTorch</td><td>2.0+</td><td>Tensor ops, CUDA</td></tr>
+              <tr><td>Transformers</td><td>4.40+</td><td>HF config probing</td></tr>
+              <tr><td>vLLM</td><td>0.4+</td><td>Serving integration</td></tr>
+              <tr><td>Triton</td><td>bundled</td><td>GPU kernels (fused dequant + attention)</td></tr>
+              <tr><td>Typer</td><td>latest</td><td>CLI</td></tr>
+              <tr><td>Rich</td><td>latest</td><td>Terminal output</td></tr>
+              <tr><td>Pydantic</td><td>v2</td><td>Schemas &amp; validation</td></tr>
+              <tr><td>SQLite</td><td>stdlib</td><td>Run storage (v1)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="stack-note">Linux only · CUDA 11.8 / 12.x · Triton JIT on first run, cached to <code>~/.triton/cache/</code>.</p>
+      </section>
+
+      <!-- Getting started -->
+      <section id="getting-started">
+        <div class="section-label">07 — Get started</div>
+        <h2>Install, <em>check, run.</em></h2>
+        <h3>Install</h3>
+        <pre><code><span class="c"># Base — analyze / optimize / doctor</span>
+pip install slm-turbo
+
+<span class="c"># With vLLM backend (needed for `serve`)</span>
+pip install "slm-turbo[gpu]"
+
+<span class="c"># Or without installing (uv)</span>
+uvx slm-turbo analyze --model meta-llama/Llama-2-7b-hf
+
+<span class="c"># From source</span>
+git clone https://github.com/sagnik3788/slm-turbo.git
+cd slm-turbo
+pip install -e ".[gpu]"
+slm-turbo doctor</code></pre>
+        <h3>Quick start</h3>
+        <pre><code>slm-turbo doctor
+slm-turbo analyze  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+slm-turbo optimize --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+slm-turbo warmup   --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+slm-turbo serve    --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --config ~/.slm-turbo/recipes/*.yaml
+slm-turbo status   <span class="c"># in another terminal</span></code></pre>
+        <p class="small">A run is <code>{baseline_profile, recipe, applied_profile, delta}</code> — persisted, diffable. Recipes are YAML, human-editable, validated against topology + device hash.</p>
+        <h3>Key concepts</h3>
+        <ul>
+          <li><strong>Prefill vs decode</strong> — prefill compute-bound, decode memory-bound. Profiled separately.</li>
+          <li><strong>Roofline</strong> — intensity (FLOPs/byte) vs ridge point to classify bound.</li>
+          <li><strong>Asymmetric quant</strong> — keys more sensitive than values; quantized differently.</li>
+          <li><strong>PagedAttention</strong> — non-contiguous KV; layouts respect paging.</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer>
+      <hr>
+      <div class="footer-grid">
+        <div style="max-width:520px">
+          <p class="footer-title">SLM Turbo</p>
+          <p class="small" style="margin:0 0 14px">Automated LLM inference optimization. Built for the GTX 1650, scales to 70B+. No buzzwords — measured recipes.</p>
+          <div class="author">
+            <div class="author-avatar">SS</div>
+            <div>
+              <p><strong>Sagnik S.</strong> — systems &amp; GPU engineering. Comparable scope: vLLM (Berkeley), llama.cpp, FlashAttention. <a href="https://github.com/sagnik3788/slm-turbo" target="_blank" rel="noopener">GitHub</a> · <a href="https://github.com/sagnik3788/slm-turbo/blob/main/LICENSE">MIT</a></p>
+              <p class="small" style="margin-top:4px">Open to systems / ML perf roles. Recipe engine, Triton kernels, vLLM adapter — one repo, end-to-end.</p>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="footer-links">
+            <a href="https://github.com/sagnik3788/slm-turbo" target="_blank" rel="noopener">GitHub</a>
+            <a href="https://github.com/sagnik3788/slm-turbo/blob/main/LICENSE">MIT License</a>
+            <a href="#">Back to top ↑</a>
+          </div>
+          <p class="small" style="margin-top:12px; max-width:32ch">Single-page, no framework, no JS. White hero + warm paper. Works offline. Print-friendly.</p>
+        </div>
+      </div>
+      <p class="foot-note">Deployed from <code>docs/</code> on GitHub Pages · <code>.nojekyll</code> · relative paths · <a href="https://github.com/sagnik3788/slm-turbo">github.com/sagnik3788/slm-turbo</a> · Hero white #fff → paper #FDFCFB</p>
+    </footer>
+  </div>
+</body>
+</html>
