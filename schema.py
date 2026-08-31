@@ -63,6 +63,7 @@ class OptimizationStep(BaseModel):
 
 class Recipe(BaseModel):
     version: str = "1.0"
+    model_id: Optional[str] = None
     topology_hash: str
     device_hash: str
     steps: List[OptimizationStep] = []
@@ -95,3 +96,8 @@ class ProfileSnapshot(BaseModel):
     model_params: int
     model_size_bytes: float
     kv_cache_bytes_per_token: int
+
+
+class Bottleneck(BaseModel):
+    prefill: Literal["memory_bound", "compute_bound"]
+    decode: Literal["memory_bound", "compute_bound"]

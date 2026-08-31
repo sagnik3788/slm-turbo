@@ -3,3 +3,4 @@ __pycache__/
 *$py.class
 agents/
 AGENTS.md
+slm_turbo.egg-info
